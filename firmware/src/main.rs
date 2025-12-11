@@ -3,14 +3,21 @@
 
 mod fmt;
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
+use defmt::Format;
+use embassy_futures::join::join;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use embassy_usb::{
-    class::hid::{self, HidReaderWriter, State},
+    class::hid::{self, HidReaderWriter, HidWriter, State},
     Builder,
 };
 #[cfg(not(feature = "defmt"))]
 use panic_halt as _;
-use usbd_hid::descriptor::{KeyboardReport, SerializedDescriptor};
+use usbd_hid::{
+    descriptor::{KeyboardReport, SerializedDescriptor},
+    hid_class::HidProtocolMode,
+};
 #[cfg(feature = "defmt")]
 use {defmt_rtt as _, panic_probe as _};
 
@@ -32,19 +39,34 @@ bind_interrupts!(struct Irqs {
     USB_LP_CAN1_RX0 => usb::InterruptHandler<peripherals::USB>;
 });
 
-struct ButtonConfig<B> {
-    button: B,
-    keycode: u8,
+struct ButtonConfig {
+    button: ExtiInput<'static>,
+    keycode: Option<u8>,
+    modifier: Option<u8>,
 }
 
-#[derive(Debug)]
 enum KeyEvent {
-    Pressed(u8),
-    Released(u8),
+    Pressed((Option<u8>, Option<u8>)),
+    Released((Option<u8>, Option<u8>)),
+}
+
+impl Format for KeyEvent {
+    fn format(&self, fmt: defmt::Formatter) {
+        match self {
+            KeyEvent::Pressed((code, modifier)) => {
+                defmt::write!(fmt, "Pressed({}, {})", code, modifier)
+            }
+            KeyEvent::Released((code, modifier)) => {
+                defmt::write!(fmt, "Released({}, {})", code, modifier)
+            }
+        }
+    }
 }
 
 type KeyChannel = Channel<CriticalSectionRawMutex, KeyEvent, 4>;
 static CHANNEL: KeyChannel = KeyChannel::new();
+
+static HID_PROTOCOL_MODE: AtomicU8 = AtomicU8::new(HidProtocolMode::Boot as u8);
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
@@ -99,13 +121,11 @@ async fn main(spawner: Spawner) {
         max_packet_size: 8,
     };
 
-    let hid = HidReaderWriter::<_, 1, 8>::new(&mut builder, &mut state, hid_config);
+    let mut writer = HidWriter::<_, 8>::new(&mut builder, &mut state, hid_config);
 
     let mut usb = builder.build();
 
     let usb_fut = usb.run();
-
-    let (reader, mut writer) = hid.split();
 
     // BUTTON GPIOs
     let mut shift_btn = ExtiInput::new(p.PB3, p.EXTI3, Pull::Up);
@@ -114,53 +134,112 @@ async fn main(spawner: Spawner) {
 
     let buttons = [
         ButtonConfig {
-            button: &shift_btn,
-            keycode: 0xE1,
-        }, // Left shift
+            button: shift_btn,
+            keycode: None,
+            modifier: Some(0x02), // left shift
+        },
         ButtonConfig {
-            button: &colon_btn,
-            keycode: 0x33,
-        }, // Colon (:) (actually semicolon)
+            button: colon_btn,
+            keycode: Some(0x33), // Colon (:) (actually semicolon)
+            modifier: None,
+        },
         ButtonConfig {
-            button: &three_btn,
-            keycode: 0x20,
-        }, // 3
+            button: three_btn,
+            keycode: Some(0x20), // 3
+            modifier: None,
+        },
     ];
 
-    let mut channel = embassy_sync::channel::Channel::new();
-    let receiver = channel.receiver();
-    let mut sender = channel.sender();
+    let sender = CHANNEL.sender();
+    let receiver = CHANNEL.receiver();
 
     for cfg in buttons {
         let sender = sender.clone();
 
         spawner
-            .spawn(async move {
-                loop {
-                    cfg.button.wait_for_rising_edge().await;
-                    sender.send(KeyEvent::Pressed(cfg.keycode)).await;
-
-                    cfg.button.wait_for_falling_edge().await;
-                    sender.send(KeyEvent::Released(cfg.keycode)).await;
-                }
-            })
+            .spawn(button_task(cfg.button, cfg.keycode, cfg.modifier, sender))
             .unwrap();
     }
 
-    loop {}
+    let writer_fut = async {
+        let mut keys: [u8; 6] = [0; 6];
+        let mut modifier: u8 = 0;
+
+        loop {
+            let event = receiver.receive().await;
+            info!("Event: {:?}", event);
+
+            match event {
+                KeyEvent::Pressed((Some(code), _)) => {
+                    // Insert keycode if there's space and not repeated
+                    if !keys.contains(&code) {
+                        if let Some(slot) = keys.iter_mut().find(|s| **s == 0) {
+                            *slot = code;
+                        }
+                    }
+                }
+                KeyEvent::Pressed((_, Some(new_modifier))) => {
+                    // Insert keycode if there's space and not repeated
+                    modifier |= new_modifier;
+                }
+                KeyEvent::Released((Some(code), _)) => {
+                    // Remove keycode from list
+                    for k in &mut keys {
+                        if *k == code {
+                            *k = 0;
+                        }
+                    }
+                }
+                KeyEvent::Released((_, Some(new_modifier))) => {
+                    modifier &= !new_modifier;
+                }
+                _ => { /* NOP */ }
+            }
+
+            // Decide boot vs report protocol
+            if HID_PROTOCOL_MODE.load(Ordering::Relaxed) == HidProtocolMode::Boot as u8 {
+                let mut boot: [u8; 8] = [0; 8];
+                boot[2..8].copy_from_slice(&keys);
+                writer.write(&boot).await.ok();
+            } else {
+                let report = KeyboardReport {
+                    keycodes: keys,
+                    leds: 0,
+                    modifier,
+                    reserved: 0,
+                };
+                writer.write_serialize(&report).await.ok();
+            }
+        }
+    };
+
+    // future that spams 'a'
+    let a_fut = async {
+        loop {
+            // FIXME: just for debuggin
+
+            info!("Sending 'a' key");
+            sender.send(KeyEvent::Pressed((Some(0x04), None))).await; // 'a' key
+
+            Timer::after(Duration::from_millis(500)).await;
+        }
+    };
+
+    join(usb_fut, join(writer_fut, a_fut)).await;
 }
 
-#[embassy_executor::task]
+#[embassy_executor::task(pool_size = 4)]
 async fn button_task(
     mut button: ExtiInput<'static>,
-    keycode: u8,
-    sender: embassy_sync::channel::Sender<'static, KeyEvent, 4>,
+    keycode: Option<u8>,
+    modifier: Option<u8>,
+    sender: embassy_sync::channel::Sender<'static, CriticalSectionRawMutex, KeyEvent, 4>,
 ) -> ! {
     loop {
         button.wait_for_rising_edge().await;
-        sender.send(KeyEvent::Pressed(keycode)).await;
+        sender.send(KeyEvent::Pressed((keycode, modifier))).await;
 
         button.wait_for_falling_edge().await;
-        sender.send(KeyEvent::Released(keycode)).await;
+        sender.send(KeyEvent::Released((keycode, modifier))).await;
     }
 }
