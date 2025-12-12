@@ -3,14 +3,15 @@
 
 mod fmt;
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use defmt::Format;
 use embassy_futures::join::join;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use embassy_usb::{
-    class::hid::{self, HidReaderWriter, HidWriter, State},
-    Builder,
+    class::hid::{self, HidReaderWriter, ReportId, RequestHandler, State},
+    control::OutResponse,
+    Builder, Handler,
 };
 #[cfg(not(feature = "defmt"))]
 use panic_halt as _;
@@ -24,9 +25,8 @@ use {defmt_rtt as _, panic_probe as _};
 use embassy_executor::Spawner;
 use embassy_stm32::{
     bind_interrupts,
-    exti::{self, ExtiInput},
-    gpio::{Input, Level, Output, Pull, Speed},
-    pac::iwdg::vals::Key,
+    exti::ExtiInput,
+    gpio::Pull,
     peripherals,
     time::Hertz,
     usb::{self, Driver},
@@ -88,7 +88,7 @@ async fn main(spawner: Spawner) {
         config.rcc.apb1_pre = APBPrescaler::DIV2;
         config.rcc.apb2_pre = APBPrescaler::DIV1;
     }
-    let p = embassy_stm32::init(config);
+    let mut p = embassy_stm32::init(config);
 
     info!("Hello, World!");
 
@@ -98,10 +98,21 @@ async fn main(spawner: Spawner) {
     let mut config = embassy_usb::Config::new(0xc0de, 0xcafe);
     config.manufacturer = Some("3nt3");
     config.product = Some("Transfem Keyboard :3");
+    config.composite_with_iads = false;
+    config.max_packet_size_0 = 64;
+    config.device_class = 0xEF;
+    config.device_sub_class = 0x02;
+    config.device_protocol = 0x01;
+
+    config.composite_with_iads = true;
 
     let mut config_descriptor = [0; 256];
     let mut bos_descriptor = [0; 256];
+    let mut msos_descriptor = [0; 256];
     let mut control_buf = [0; 7];
+
+    let mut request_handler = MyRequestHandler {};
+    let mut device_handler = MyDeviceHandler::new();
 
     let mut state = State::new();
 
@@ -110,9 +121,11 @@ async fn main(spawner: Spawner) {
         config,
         &mut config_descriptor,
         &mut bos_descriptor,
-        &mut [],
+        &mut msos_descriptor,
         &mut control_buf,
     );
+
+    builder.handler(&mut device_handler);
 
     let hid_config = hid::Config {
         report_descriptor: KeyboardReport::desc(),
@@ -121,7 +134,8 @@ async fn main(spawner: Spawner) {
         max_packet_size: 8,
     };
 
-    let mut writer = HidWriter::<_, 8>::new(&mut builder, &mut state, hid_config);
+    let mut hid = HidReaderWriter::<_, 1, 8>::new(&mut builder, &mut state, hid_config);
+    let (reader, mut writer) = hid.split();
 
     let mut usb = builder.build();
 
@@ -200,6 +214,7 @@ async fn main(spawner: Spawner) {
             if HID_PROTOCOL_MODE.load(Ordering::Relaxed) == HidProtocolMode::Boot as u8 {
                 let mut boot: [u8; 8] = [0; 8];
                 boot[2..8].copy_from_slice(&keys);
+                boot[0] = modifier;
                 writer.write(&boot).await.ok();
             } else {
                 let report = KeyboardReport {
@@ -211,6 +226,10 @@ async fn main(spawner: Spawner) {
                 writer.write_serialize(&report).await.ok();
             }
         }
+    };
+
+    let out_fut = async {
+        reader.run(false, &mut request_handler).await;
     };
 
     // future that spams 'a'
@@ -225,7 +244,9 @@ async fn main(spawner: Spawner) {
         }
     };
 
-    join(usb_fut, join(writer_fut, a_fut)).await;
+    join(usb_fut, join(writer_fut, out_fut)).await;
+
+    loop {}
 }
 
 #[embassy_executor::task(pool_size = 4)]
@@ -241,5 +262,72 @@ async fn button_task(
 
         button.wait_for_falling_edge().await;
         sender.send(KeyEvent::Released((keycode, modifier))).await;
+    }
+}
+
+struct MyRequestHandler {}
+
+impl RequestHandler for MyRequestHandler {
+    fn get_report(&mut self, id: ReportId, _buf: &mut [u8]) -> Option<usize> {
+        info!("Get report for {:?}", id);
+        None
+    }
+
+    fn set_report(&mut self, id: ReportId, data: &[u8]) -> OutResponse {
+        info!("Set report for {:?}: {=[u8]}", id, data);
+        OutResponse::Accepted
+    }
+
+    fn set_idle_ms(&mut self, id: Option<ReportId>, dur: u32) {
+        info!("Set idle rate for {:?} to {:?}", id, dur);
+    }
+
+    fn get_idle_ms(&mut self, id: Option<ReportId>) -> Option<u32> {
+        info!("Get idle rate for {:?}", id);
+        None
+    }
+}
+
+struct MyDeviceHandler {
+    configured: AtomicBool,
+}
+
+impl MyDeviceHandler {
+    fn new() -> Self {
+        MyDeviceHandler {
+            configured: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Handler for MyDeviceHandler {
+    fn enabled(&mut self, enabled: bool) {
+        self.configured.store(false, Ordering::Relaxed);
+        if enabled {
+            info!("Device enabled");
+        } else {
+            info!("Device disabled");
+        }
+    }
+
+    fn reset(&mut self) {
+        self.configured.store(false, Ordering::Relaxed);
+        info!("Bus reset, the Vbus current limit is 100mA");
+    }
+
+    fn addressed(&mut self, addr: u8) {
+        self.configured.store(false, Ordering::Relaxed);
+        info!("USB address set to: {}", addr);
+    }
+
+    fn configured(&mut self, configured: bool) {
+        self.configured.store(configured, Ordering::Relaxed);
+        if configured {
+            info!(
+                "Device configured, it may now draw up to the configured current limit from Vbus."
+            )
+        } else {
+            info!("Device is no longer configured, the Vbus current limit is 100mA.");
+        }
     }
 }
