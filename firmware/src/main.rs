@@ -26,7 +26,7 @@ use embassy_executor::Spawner;
 use embassy_stm32::{
     bind_interrupts,
     exti::ExtiInput,
-    gpio::Pull,
+    gpio::{Level, Output, Pull, Speed},
     peripherals,
     time::Hertz,
     usb::{self, Driver},
@@ -74,13 +74,13 @@ async fn main(spawner: Spawner) {
     {
         use embassy_stm32::rcc::*;
         config.rcc.hse = Some(Hse {
-            freq: Hertz(16_000_000),
+            freq: Hertz(8_000_000),
             mode: HseMode::Oscillator,
         });
 
         config.rcc.pll = Some(Pll {
             src: PllSource::HSE,
-            prediv: PllPreDiv::DIV2,
+            prediv: PllPreDiv::DIV1,
             mul: PllMul::MUL9,
         });
         config.rcc.sys = Sysclk::PLL1_P;
@@ -89,6 +89,15 @@ async fn main(spawner: Spawner) {
         config.rcc.apb2_pre = APBPrescaler::DIV1;
     }
     let mut p = embassy_stm32::init(config);
+
+    {
+        // BluePill board has a pull-up resistor on the D+ line.
+        // Pull the D+ pin down to send a RESET condition to the USB bus.
+        // This forced reset is needed only for development, without it host
+        // will not reset your device when you upload new firmware.
+        let _dp = Output::new(p.PA12.reborrow(), Level::High, Speed::Low);
+        Timer::after_millis(10).await;
+    }
 
     info!("Hello, World!");
 
@@ -100,16 +109,14 @@ async fn main(spawner: Spawner) {
     config.product = Some("Transfem Keyboard :3");
     config.composite_with_iads = false;
     config.max_packet_size_0 = 64;
-    config.device_class = 0xEF;
-    config.device_sub_class = 0x02;
-    config.device_protocol = 0x01;
-
-    config.composite_with_iads = true;
+    config.device_class = 1;
+    config.device_sub_class = 0;
+    config.device_protocol = 0;
 
     let mut config_descriptor = [0; 256];
     let mut bos_descriptor = [0; 256];
     let mut msos_descriptor = [0; 256];
-    let mut control_buf = [0; 7];
+    let mut control_buf = [0; 128];
 
     let mut request_handler = MyRequestHandler {};
     let mut device_handler = MyDeviceHandler::new();
@@ -131,15 +138,16 @@ async fn main(spawner: Spawner) {
         report_descriptor: KeyboardReport::desc(),
         request_handler: None,
         poll_ms: 60,
-        max_packet_size: 8,
+        max_packet_size: 64,
     };
 
-    let mut hid = HidReaderWriter::<_, 1, 8>::new(&mut builder, &mut state, hid_config);
-    let (reader, mut writer) = hid.split();
+    let hid = HidReaderWriter::<_, 1, 8>::new(&mut builder, &mut state, hid_config);
 
     let mut usb = builder.build();
 
     let usb_fut = usb.run();
+
+    let (reader, mut writer) = hid.split();
 
     // BUTTON GPIOs
     let mut shift_btn = ExtiInput::new(p.PB3, p.EXTI3, Pull::Up);
@@ -239,12 +247,14 @@ async fn main(spawner: Spawner) {
 
             info!("Sending 'a' key");
             sender.send(KeyEvent::Pressed((Some(0x04), None))).await; // 'a' key
+            Timer::after(Duration::from_millis(100)).await;
+            sender.send(KeyEvent::Released((Some(0x04), None))).await; // 'a' key
 
             Timer::after(Duration::from_millis(500)).await;
         }
     };
 
-    join(usb_fut, join(writer_fut, out_fut)).await;
+    join(usb_fut, join(join(a_fut, writer_fut), out_fut)).await;
 
     loop {}
 }
