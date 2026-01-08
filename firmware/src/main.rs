@@ -192,30 +192,34 @@ async fn main(spawner: Spawner) {
             info!("Event: {:?}", event);
 
             match event {
-                KeyEvent::Pressed((Some(code), _)) => {
-                    // Insert keycode if there's space and not repeated
-                    if !keys.contains(&code) {
-                        if let Some(slot) = keys.iter_mut().find(|s| **s == 0) {
-                            *slot = code;
+                KeyEvent::Pressed((code, mod_val)) => {
+                    // Handle keycode
+                    if let Some(code) = code {
+                        if !keys.contains(&code) {
+                            if let Some(slot) = keys.iter_mut().find(|s| **s == 0) {
+                                *slot = code;
+                            }
                         }
                     }
-                }
-                KeyEvent::Pressed((_, Some(new_modifier))) => {
-                    // Insert keycode if there's space and not repeated
-                    modifier |= new_modifier;
-                }
-                KeyEvent::Released((Some(code), _)) => {
-                    // Remove keycode from list
-                    for k in &mut keys {
-                        if *k == code {
-                            *k = 0;
-                        }
+                    // Handle modifier
+                    if let Some(new_modifier) = mod_val {
+                        modifier |= new_modifier;
                     }
                 }
-                KeyEvent::Released((_, Some(new_modifier))) => {
-                    modifier &= !new_modifier;
+                KeyEvent::Released((code, mod_val)) => {
+                    // Handle keycode
+                    if let Some(code) = code {
+                        for k in &mut keys {
+                            if *k == code {
+                                *k = 0;
+                            }
+                        }
+                    }
+                    // Handle modifier
+                    if let Some(new_modifier) = mod_val {
+                        modifier &= !new_modifier;
+                    }
                 }
-                _ => { /* NOP */ }
             }
 
             // Decide boot vs report protocol
@@ -245,10 +249,8 @@ async fn main(spawner: Spawner) {
         loop {
             // FIXME: just for debuggin
 
-            info!("Sending 'a' key");
-            sender.send(KeyEvent::Pressed((Some(0x04), None))).await; // 'a' key
-            Timer::after(Duration::from_millis(100)).await;
-            sender.send(KeyEvent::Released((Some(0x04), None))).await; // 'a' key
+            info!("sending ':3\n'");
+            send_text(":3\n", &sender).await;
 
             Timer::after(Duration::from_millis(500)).await;
         }
@@ -339,5 +341,36 @@ impl Handler for MyDeviceHandler {
         } else {
             info!("Device is no longer configured, the Vbus current limit is 100mA.");
         }
+    }
+}
+
+// send text as KeyPress and KeyRelease events
+async fn send_text(
+    text: &str,
+    sender: &embassy_sync::channel::Sender<'static, CriticalSectionRawMutex, KeyEvent, 4>,
+) {
+    for c in text.chars() {
+        let keycode = char_to_keycode(c);
+        if let Some((code, modifier)) = keycode {
+            sender.send(KeyEvent::Pressed((Some(code), modifier))).await;
+            Timer::after(Duration::from_millis(50)).await;
+            sender
+                .send(KeyEvent::Released((Some(code), modifier)))
+                .await;
+            Timer::after(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+fn char_to_keycode(c: char) -> Option<(u8, Option<u8>)> {
+    match c {
+        'a'..='z' => Some(((c as u8 - b'a') + 0x04, None)),
+        'A'..='Z' => Some(((c as u8 - b'A') + 0x04, Some(0x02))), // left shift
+        '1'..='9' => Some(((c as u8 - b'1') + 0x1E, None)),
+        '0' => Some((0x27, None)),
+        ' ' => Some((0x2C, None)),
+        '\n' => Some((0x28, None)),
+        ':' => Some((0x33, Some(0x02))), // Shift + semicolon
+        _ => None,
     }
 }
